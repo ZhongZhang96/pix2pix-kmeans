@@ -32,6 +32,8 @@ parser.add_argument("--separable_conv", action="store_true", help="use separable
 parser.add_argument("--aspect_ratio", type=float, default=1.0, help="aspect ratio of output images (width/height)")
 parser.add_argument("--lab_colorization", action="store_true", help="split input image into brightness (A) and color (B)")
 parser.add_argument("--batch_size", type=int, default=1, help="number of images in batch")
+parser.add_argument("--kmeans_iters", type=int, default=10, help="number of K-Means iterations")
+parser.add_argument("--num_cluster", type=int, default=5, help="number of K-Means clusters")
 parser.add_argument("--which_direction", type=str, default="AtoB", choices=["AtoB", "BtoA"])
 parser.add_argument("--ngf", type=int, default=64, help="number of generator filters in first conv layer")
 parser.add_argument("--ndf", type=int, default=64, help="number of discriminator filters in first conv layer")
@@ -461,7 +463,7 @@ def create_model(inputs, targets):
             
             rep_points = tf.reshape(tf.tile(points, [1, NC]), [num_points, NC, dimensions])
             
-            for _ in range(10):
+            for _ in range(a.kmeans_iters):
                 rep_centroids = tf.reshape(tf.tile(centroids, [num_points, 1]), [num_points, NC, dimensions])
                 sum_squares = tf.reduce_sum(tf.square(rep_points - rep_centroids), reduction_indices=2)
                 best_centroids = tf.argmin(sum_squares, 1, output_type=tf.dtypes.int32)           # 样本对应的聚类中心索引           
@@ -474,7 +476,7 @@ def create_model(inputs, targets):
         t = tf.reshape(targets, [-1, 3])
         f = tf.reshape(outputs, [-1, 3])
             
-        assignments = KMeans(t, 5)
+        assignments = KMeans(t, a.num_cluster)
         gen_loss_L1 = 5*tf.reduce_mean(bucket_mean(tf.abs(t-f), assignments, 5))/a.batch_size
         gen_loss_GAN = tf.reduce_mean(-tf.log(predict_fake + EPS))
         # gen_loss_L1 = tf.reduce_mean(tf.abs(targets - outputs))
