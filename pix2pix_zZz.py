@@ -29,10 +29,10 @@ parser.add_argument("--display_freq", type=int, default=0, help="write current t
 parser.add_argument("--save_freq", type=int, default=5000, help="save model every save_freq steps, 0 to disable")
 
 parser.add_argument("--separable_conv", action="store_true", help="use separable convolutions in the generator")
+parser.add_argument("--use_lsgan", action="store_true", help="use LSGAN Loss")
 parser.add_argument("--aspect_ratio", type=float, default=1.0, help="aspect ratio of output images (width/height)")
 parser.add_argument("--lab_colorization", action="store_true", help="split input image into brightness (A) and color (B)")
 parser.add_argument("--batch_size", type=int, default=1, help="number of images in batch")
-parser.add_argument("--kmeans_iters", type=int, default=10, help="number of K-Means iterations")
 parser.add_argument("--num_cluster", type=int, default=5, help="number of K-Means clusters")
 parser.add_argument("--which_direction", type=str, default="AtoB", choices=["AtoB", "BtoA"])
 parser.add_argument("--ngf", type=int, default=64, help="number of generator filters in first conv layer")
@@ -43,7 +43,8 @@ parser.add_argument("--no_flip", dest="flip", action="store_false", help="don't 
 parser.set_defaults(flip=True)
 parser.add_argument("--lr", type=float, default=0.0002, help="initial learning rate for adam")
 parser.add_argument("--beta1", type=float, default=0.5, help="momentum term of adam")
-parser.add_argument("--l1_weight", type=float, default=100.0, help="weight on L1 term for generator gradient")
+parser.add_argument("--color_weight", type=float, default=100.0, help="weight on color term for generator gradient")
+parser.add_argument("--structure_weight", type=float, default=100.0, help="weight on structure term for generator gradient")
 parser.add_argument("--gan_weight", type=float, default=1.0, help="weight on GAN term for generator gradient")
 
 # export options
@@ -52,9 +53,10 @@ a = parser.parse_args()
 
 EPS = 1e-12
 CROP_SIZE = 256
+REAL_LABEL = 0.9
 
 Examples = collections.namedtuple("Examples", "paths, inputs, targets, count, steps_per_epoch")
-Model = collections.namedtuple("Model", "outputs, predict_real, predict_fake, discrim_loss, discrim_grads_and_vars, gen_loss_GAN, gen_loss_L1, gen_grads_and_vars, train")
+Model = collections.namedtuple("Model", "outputs, predict_real, predict_fake, discrim_loss, discrim_grads_and_vars, gen_loss_GAN, gen_loss_color, gen_loss_structure, gen_grads_and_vars, train")
 
 
 def preprocess(image):
@@ -447,7 +449,10 @@ def create_model(inputs, targets):
         # minimizing -tf.log will try to get inputs to 1
         # predict_real => 1
         # predict_fake => 0
-        discrim_loss = tf.reduce_mean(-(tf.log(predict_real + EPS) + tf.log(1 - predict_fake + EPS)))
+        if a.use_lsgan:
+            discrim_loss = tf.reduce_mean(tf.squared_difference(predict_real, REAL_LABEL)+tf.square(predict_fake))
+        else:
+            discrim_loss = tf.reduce_mean(-(tf.log(predict_real + EPS) + tf.log(1 - predict_fake + EPS)))
 
     with tf.name_scope("generator_loss"):
         def bucket_mean(data, bucket_ids, num_buckets):
@@ -459,17 +464,26 @@ def create_model(inputs, targets):
             num_points = CROP_SIZE**2
             dimensions = 3
             centroids = tf.random.uniform([NC, dimensions])
-            assignments = tf.random.uniform([num_points], 0, 5, dtype=tf.int32)
+            assignments1 = tf.random.uniform([num_points], 0, NC, dtype=tf.int32)
+            assignments2 = tf.random.uniform([num_points], 0, NC, dtype=tf.int32)
             
             rep_points = tf.reshape(tf.tile(points, [1, NC]), [num_points, NC, dimensions])
             
-            for _ in range(a.kmeans_iters):
+            def loop(assignments1, assignments2, centroids):
                 rep_centroids = tf.reshape(tf.tile(centroids, [num_points, 1]), [num_points, NC, dimensions])
                 sum_squares = tf.reduce_sum(tf.square(rep_points - rep_centroids), reduction_indices=2)
                 best_centroids = tf.argmin(sum_squares, 1, output_type=tf.dtypes.int32)           # 样本对应的聚类中心索引           
                 means = bucket_mean(points, best_centroids, NC)      
-                centroids=means
-                assignments=best_centroids          
+                centroids = means
+                assignments1 = assignments2
+                assignments2 = best_centroids  
+                return assignments1, assignments2, centroids
+            
+            def cond(assignments1, assignments2, centroids):
+                return tf.not_equal(tf.reduce_mean(tf.abs(assignments1-assignments2)), tf.constant(0))
+
+            _, assignments, centroids = tf.while_loop(cond, loop, [assignments1, assignments2, centroids])
+      
             return assignments
         # predict_fake => 1
         # abs(targets - outputs) => 0
@@ -477,10 +491,14 @@ def create_model(inputs, targets):
         f = tf.reshape(outputs, [-1, 3])
             
         assignments = KMeans(t, a.num_cluster)
-        gen_loss_L1 = 5*tf.reduce_mean(bucket_mean(tf.abs(t-f), assignments, 5))/a.batch_size
-        gen_loss_GAN = tf.reduce_mean(-tf.log(predict_fake + EPS))
+        gen_loss_color = a.num_cluster*tf.reduce_mean(bucket_mean(tf.abs(t-f), assignments, a.num_cluster))/a.batch_size
+        gen_loss_structure =  tf.reduce_mean(tf.abs(tf.image.rgb_to_grayscale(targets) - tf.image.rgb_to_grayscale(outputs)))
+        if a.use_lsgan:
+            gen_loss_GAN = tf.reduce_mean(tf.squared_difference(predict_fake, REAL_LABEL))
+        else:
+            gen_loss_GAN = tf.reduce_mean(-tf.log(predict_fake + EPS))
         # gen_loss_L1 = tf.reduce_mean(tf.abs(targets - outputs))
-        gen_loss = gen_loss_GAN * a.gan_weight + gen_loss_L1 * a.l1_weight
+        gen_loss = gen_loss_GAN * a.gan_weight + gen_loss_color * a.color_weight + gen_loss_structure * a.structure_weight
 
     with tf.name_scope("discriminator_train"):
         discrim_tvars = [var for var in tf.trainable_variables() if var.name.startswith("discriminator")]
@@ -496,7 +514,7 @@ def create_model(inputs, targets):
             gen_train = gen_optim.apply_gradients(gen_grads_and_vars)
 
     ema = tf.train.ExponentialMovingAverage(decay=0.99)
-    update_losses = ema.apply([discrim_loss, gen_loss_GAN, gen_loss_L1])
+    update_losses = ema.apply([discrim_loss, gen_loss_GAN, gen_loss_color, gen_loss_structure])
 
     global_step = tf.train.get_or_create_global_step()
     incr_global_step = tf.assign(global_step, global_step+1)
@@ -507,7 +525,8 @@ def create_model(inputs, targets):
         discrim_loss=ema.average(discrim_loss),
         discrim_grads_and_vars=discrim_grads_and_vars,
         gen_loss_GAN=ema.average(gen_loss_GAN),
-        gen_loss_L1=ema.average(gen_loss_L1),
+        gen_loss_color=ema.average(gen_loss_color),
+        gen_loss_structure=ema.average(gen_loss_structure),
         gen_grads_and_vars=gen_grads_and_vars,
         outputs=outputs,
         train=tf.group(update_losses, incr_global_step, gen_train),
@@ -722,7 +741,8 @@ def main():
 
     tf.summary.scalar("discriminator_loss", model.discrim_loss)
     tf.summary.scalar("generator_loss_GAN", model.gen_loss_GAN)
-    tf.summary.scalar("generator_loss_L1", model.gen_loss_L1)
+    tf.summary.scalar("generator_loss_color", model.gen_loss_color)
+    tf.summary.scalar("generator_loss_structure", model.gen_loss_structure)
 
     for var in tf.trainable_variables():
         tf.summary.histogram(var.op.name + "/values", var)
@@ -786,7 +806,8 @@ def main():
                 if should(a.progress_freq):
                     fetches["discrim_loss"] = model.discrim_loss
                     fetches["gen_loss_GAN"] = model.gen_loss_GAN
-                    fetches["gen_loss_L1"] = model.gen_loss_L1
+                    fetches["gen_loss_color"] = model.gen_loss_color
+                    fetches["gen_loss_structure"] = model.gen_loss_structure
 
                 if should(a.summary_freq):
                     fetches["summary"] = sv.summary_op
@@ -818,7 +839,8 @@ def main():
                     print("progress  epoch %d  step %d  image/sec %0.1f  remaining %dm" % (train_epoch, train_step, rate, remaining / 60))
                     print("discrim_loss", results["discrim_loss"])
                     print("gen_loss_GAN", results["gen_loss_GAN"])
-                    print("gen_loss_L1", results["gen_loss_L1"])
+                    print("gen_loss_color", results["gen_loss_color"])
+                    print("gen_loss_structure", results["gen_loss_structure"])
 
                 if should(a.save_freq):
                     print("saving model")
